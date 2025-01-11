@@ -1,0 +1,177 @@
+---
+title: "How many biological replicates are needed in an RNA-seq experiment and which differential expression tool should you use?"
+output: html_document
+date: "2025-01-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The data sets supporting the results of this article are available in the European Nucleotide Archive repository (ENA) (PRJEB5348,http:// www.ebi.ac.uk/ena/data/view/ERX425102). All the code for this work is publicly available (https://github.com/bartongroup/profDGE48).
+
+# Load packages
+
+```{r}
+suppressMessages(library(dplyr))
+suppressMessages(library(edgeR))
+suppressMessages(library(limma))
+suppressMessages(library(DESeq2))
+suppressMessages(library(ggplot2))
+suppressMessages(library(GGally))
+```
+
+# Read in the data
+```{r}
+x <- read.delim("WT_raw.tsv", row.names =1, header = F)
+dim(x) # 7126 x 48
+summary(c(as.matrix(x)))
+x2 <- read.delim("Snf2_raw.tsv", row.names =1, header = F)
+dim(x2) # 7126   48
+```
+
+```{r}
+geneCounts = cbind(x, x2)
+## strip out zero count genes in all samples
+geneCounts = geneCounts[rowSums(geneCounts)>0,]
+dim(geneCounts)
+# [1] 6887   96
+
+## Read conditions/groups matrix
+groups <- rep(c("WT", "Mut"), c(48, 48))
+```
+
+# Convenience function
+```{r}
+DE_fun <- function(counts, groups, method = 'edgeR') {
+  if (method == 'edgeR') {
+    # require(edgeR)
+    d = DGEList(geneCounts,group=groups)
+    keep <- filterByExpr(d)
+    d <- d[keep,,keep.lib.sizes=FALSE]
+    d <- calcNormFactors(d)
+    
+    # Estimating both common and tagwise dispersions allows for more precise modeling of gene-specific variability
+    d <- estimateDisp(d)
+    # the exact test is only applicable to experiments with a single factor
+    de.com <- exactTest(d)
+    res=de.com$table
+    out <- data.frame(gene = rownames(res),
+                logFC = res$logFC,
+                p = res$PValue,
+                adjp = p.adjust(res$PValue,method='BH'))
+  } else if (method == "DESeq2") {
+    # require(DESeq2)
+    colData <- data.frame(condition = factor(groups))
+    dds <- DESeqDataSetFromMatrix(countData = counts,
+                                colData = colData,
+                                design = ~ condition)
+    dds <- DESeq(dds)
+    res <- results(dds, contrast = c("condition", "Mut", "WT"))
+    out <- data.frame(gene = rownames(res),
+                    logFC = res$log2FoldChange,
+                    p = res$pvalue,
+                    adjp = res$padj)
+  } else if (method == "limma") {
+    # require(limma)
+    design <- model.matrix(~groups)
+
+    dge <- DGEList(counts)
+    keep <- filterByExpr(dge, design)
+    dge <- dge[keep,,keep.lib.sizes=FALSE]
+    dge <- calcNormFactors(dge)
+    v <- voom(dge, design, plot=TRUE)
+    fit <- lmFit(v, design)
+    fit <- eBayes(fit)
+    res <- topTable(fit, coef = 2, number = Inf)
+    out <- data.frame(gene = rownames(res),
+                    logFC = res$logFC,
+                    p = res$P.Value,
+                    adjp = res$adj.P.Val)
+  } else {
+    out <- NULL
+  }
+  # volcano plot
+  p <- as.data.frame(out) %>% ggplot(aes(x=logFC, y = -log10(adjp))) + 
+    geom_point(aes(color = adjp < 0.05)) +
+    labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-value") +
+     theme_minimal()
+  list(table = out, p = p)
+}
+```
+
+# edgeR
+
+```{r}
+o <- DE_fun(geneCounts, groups, 'edgeR')
+o.edgeR <- o
+names(o) # "out"  "p"
+print(o$p); nrow(o$table); mean(o$table$adjp < .05)
+
+head(o$table)
+```
+
+# DESeq2
+
+```{r}
+o <- DE_fun(geneCounts, groups, 'DESeq2')
+o.DESeq2 <- o
+names(o) # "out"  "p"
+print(o$p); nrow(o$table); mean(o$table$adjp < .05)
+
+head(o$table)
+```
+
+# limma
+
+```{r}
+o <- DE_fun(geneCounts, groups, 'limma')
+o.limma <- o
+names(o) # "out"  "p"
+print(o$p); nrow(o$table); mean(o$table$adjp < .05)
+
+head(o$table)
+```
+
+# Pairwise comparison
+
+Why limma gave quite small p-values.
+Pairwise scatter plots.
+```{r}
+# Merging using dplyr's inner_join and draw pairwise scatter plots
+mat <- o.edgeR$table[, c("gene", "p")] %>%
+  inner_join(o.DESeq2$table[, c("gene", "p")], by = "gene") %>%
+  inner_join(o.limma$table[, c("gene", "p")], by = "gene")
+dim(mat) # [1] 6132    4
+colnames(mat) <- c("gene", "p.edgeR", "p.DESeq2", "p.limma")
+ggpairs(mat, columns = c("p.edgeR", "p.DESeq2", "p.limma"))
+
+# Repeat for FDR values
+mat <- o.edgeR$table[, c("gene", "adjp")] %>%
+  inner_join(o.DESeq2$table[, c("gene", "adjp")], by = "gene") %>%
+  inner_join(o.limma$table[, c("gene", "adjp")], by = "gene")
+dim(mat) # [1] 6132    4
+colnames(mat) <- c("gene", "adjp.edgeR", "adjp.DESeq2", "adjp.limma")
+ggpairs(mat, columns = c("adjp.edgeR", "adjp.DESeq2", "adjp.limma"),
+    title = "FDR adjusted p-values",
+    upper = list(continuous = wrap("cor",
+            size = 3)),
+    lower = list(
+            continuous = wrap("smooth",
+            alpha = 0.3,
+            size = 0.1)))
+
+# Consider two points edgeR and DESeq2 gave quite different p
+i <- which(mat$adjp.edgeR > .75 & mat$adjp.DESeq2 < .25); i
+
+mat[i, ]
+
+o.edgeR$table[match(mat$gene[i], o.edgeR$table$gene), ]
+
+o.DESeq2$table[match(mat$gene[i], o.DESeq2$table$gene), ]
+
+# Distributions of "yhr143w-a"
+geneCounts["yhr143w-a", 1:48]
+geneCounts["yhr143w-a", 49:96]
+```
+
